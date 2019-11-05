@@ -1,4 +1,5 @@
 /*
+ *  libnss-winz, Yet another libnss-wins
  *  Copyright (C) 2019 Shinichi Fuchita (@soramimi_jp)
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -32,6 +33,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <string>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/types.h>
@@ -202,6 +204,11 @@ int query_send(Mode mode, std::string const &name)
 
 void query_recv(Mode mode, int sock, std::string name, std::vector<uint32_t> *addrs_out)
 {
+	{ // set to non blocking
+		int yes = 1;
+		ioctl(sock, FIONBIO, &yes);
+	}
+	
 	// 応答パケットを受信
 	char buf[2048];
 	socklen_t addrlen;
@@ -329,25 +336,41 @@ void query(std::string name, std::vector<uint32_t> *addrs_out)
 {
 	addrs_out->clear();
 
-	int sock_wins = query_send(Mode::WINS, name);
-	int sock_llmnr = query_send(Mode::LLMNR, name);
-
-	fd_set fds;
-	FD_ZERO(&fds);
-	FD_SET(sock_wins, &fds);
-	FD_SET(sock_llmnr, &fds);
-	struct timeval timeout = {};
-	timeout.tv_sec = 1;
-	timeout.tv_usec = 0;
-	select(std::max(sock_wins, sock_llmnr) + 1, &fds, nullptr, nullptr, &timeout);
-	if (FD_ISSET(sock_wins, &fds)) {
-		query_recv(Mode::WINS, sock_wins, name, addrs_out);
-	} else if (FD_ISSET(sock_llmnr, &fds)) {
-		query_recv(Mode::LLMNR, sock_wins, name, addrs_out);
+	for (int i = 0; name[i]; i++) {
+		if (i >= 15) { // too long
+			return; // invalid name
+		}
+		int c = (unsigned char)name[i];
+		if (isalnum(c)) {
+			// ok
+		} else if (isspace(c) || strchr(".\\/:+?\"<>|", c)) {
+			return; // invalid name
+		}
 	}
 
-	close(sock_wins);
-	close(sock_llmnr);
+	for (int retry = 0; retry < 3; retry++) {
+		int sock_wins = query_send(Mode::WINS, name);
+		int sock_llmnr = query_send(Mode::LLMNR, name);
+
+		fd_set fds;
+		FD_ZERO(&fds);
+		FD_SET(sock_wins, &fds);
+		FD_SET(sock_llmnr, &fds);
+		struct timeval timeout = {};
+		timeout.tv_sec = 0;
+		timeout.tv_usec = 300000;
+		select(std::max(sock_wins, sock_llmnr) + 1, &fds, nullptr, nullptr, &timeout);
+		if (FD_ISSET(sock_wins, &fds)) {
+			query_recv(Mode::WINS, sock_wins, name, addrs_out);
+		} else if (FD_ISSET(sock_llmnr, &fds)) {
+			query_recv(Mode::LLMNR, sock_wins, name, addrs_out);
+		}
+
+		close(sock_wins);
+		close(sock_llmnr);
+
+		if (!addrs_out->empty()) break;
+	}
 }
 
 /// nsswitch interface
@@ -363,47 +386,31 @@ extern "C" enum nss_status _nss_winz_gethostbyname_r(const char *name, struct ho
 
 	std::vector<uint32_t> addrs;
 
-	bool ok = true;
-	for (int i = 0; name[i]; i++) {
-		if (i >= 15) {
-			ok = false;
-			break;
-		}
-		int c = (unsigned char)name[i];
-		if (isalnum(c)) {
-			// nop
-		} else if (isspace(c) || strchr(".\\/:+?\"<>|", c)) {
-			ok = false;
-			break;
-		}
-	}
-	if (ok) {
-		query(name, &addrs);
-		if (!addrs.empty()) {
-			*(char **)buffer = NULL;
-			result->h_aliases = (char **)buffer;
-			idx = sizeof(char *);
+	query(name, &addrs);
+	if (!addrs.empty()) {
+		*(char **)buffer = NULL;
+		result->h_aliases = (char **)buffer;
+		idx = sizeof(char *);
 
-			strcpy(buffer + idx, name);
-			result->h_name = buffer + idx;
-			idx += strlen(name) + 1;
-			ALIGN(idx);
+		strcpy(buffer + idx, name);
+		result->h_name = buffer + idx;
+		idx += strlen(name) + 1;
+		ALIGN(idx);
 
-			result->h_addrtype = AF_INET;
-			result->h_length = sizeof(uint32_t);
+		result->h_addrtype = AF_INET;
+		result->h_length = sizeof(uint32_t);
 
-			uint32_t addr = htonl(addrs.front());
+		uint32_t addr = htonl(addrs.front());
 
-			astart = idx;
-			memcpy(buffer + astart, &addr, sizeof(uint32_t));
-			idx += sizeof(uint32_t);
+		astart = idx;
+		memcpy(buffer + astart, &addr, sizeof(uint32_t));
+		idx += sizeof(uint32_t);
 
-			result->h_addr_list = (char **)(buffer + idx);
-			result->h_addr_list[0] = buffer + astart;
-			result->h_addr_list[1] = NULL;
+		result->h_addr_list = (char **)(buffer + idx);
+		result->h_addr_list[0] = buffer + astart;
+		result->h_addr_list[1] = NULL;
 
-			return NSS_STATUS_SUCCESS;
-		}
+		return NSS_STATUS_SUCCESS;
 	}
 
 	*errnop = EINVAL;
