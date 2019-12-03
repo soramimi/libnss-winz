@@ -22,8 +22,10 @@
  *    nss-openvpn, (C) 2014 Gonéri Le Bouder
  */
 
+#include <algorithm>
 #include <arpa/inet.h>
 #include <errno.h>
+#include <ifaddrs.h>
 #include <map>
 #include <netdb.h>
 #include <netinet/in.h>
@@ -41,6 +43,37 @@
 #include <vector>
 
 #define stricmp(A, B) strcasecmp(A, B)
+
+/// network interfaces
+
+struct netif_t {
+	uint32_t addr;
+	uint32_t mask;
+};
+
+void get_netif_table(std::vector<netif_t> *out)
+{
+	out->clear();
+	struct ifaddrs *ifa_list;
+	if (getifaddrs(&ifa_list) == 0) {
+		for (struct ifaddrs *ifa = ifa_list; ifa; ifa = ifa->ifa_next) {
+			if (ifa->ifa_addr) {
+				if (ifa->ifa_addr->sa_family == AF_INET) {
+					netif_t netif;
+					netif.addr = ntohl(((struct sockaddr_in *)ifa->ifa_addr)->sin_addr.s_addr);
+					netif.mask = ntohl(((struct sockaddr_in *)ifa->ifa_netmask)->sin_addr.s_addr);
+					if (netif.addr == 0) continue;
+					if (netif.addr == 0x7f000001) continue;
+					if (netif.addr == 0x7f000101) continue;
+					out->push_back(netif);
+				} else if (ifa->ifa_addr->sa_family == AF_INET6) {
+					// not implemented
+				}
+			}
+		}
+		freeifaddrs(ifa_list);
+	}
+}
 
 /// name resolver
 
@@ -105,26 +138,39 @@ enum Mode {
 	LLMNR,
 };
 
-int query_send(Mode mode, std::string const &name)
+int query_send(Mode mode, std::string const &name, netif_t const *netif)
 {
 	int sock;
-	struct sockaddr_in addr;
+	struct sockaddr_in addr = {};
+	struct ip_mreq mreq = {};
+	bool multicast = false;
 	char buf[2048];
 	// AF_INET+SOCK_DGRAMなので、IPv4のUDPソケット
-	sock = socket(AF_INET, SOCK_DGRAM, 0);
+	sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 	// 待ち受けポート番号を137にするためにbind()を行う
 	addr.sin_family = AF_INET;
+	in_addr_t a = 0;
 	if (mode == WINS) {
+		if (netif) {
+			a = netif->addr | ~netif->mask;
+			a = htonl(a);
+		} else {
+			a = INADDR_ANY;
+		}
 		int yes = 1;
 		addr.sin_port = htons(137);
-		addr.sin_addr.s_addr = INADDR_BROADCAST;
+		addr.sin_addr.s_addr = a;
 		setsockopt(sock, SOL_SOCKET, SO_BROADCAST, (char *)&yes, sizeof(yes));
 	} else if (mode == LLMNR) {
 		addr.sin_port = htons(5355);
 		addr.sin_addr.s_addr = INADDR_ANY;
+		mreq.imr_multiaddr.s_addr = htonl(0xe00000fc); // 224.0.0.252
+		multicast = true;
 	} else if (mode == MDNS) {
 		addr.sin_port = htons(5353);
 		addr.sin_addr.s_addr = INADDR_ANY;
+		mreq.imr_multiaddr.s_addr = htonl(0xe00000fb); // 224.0.0.251
+		multicast = true;
 	} else if (mode == DNS) {
 		addr.sin_port = htons(53);
 		addr.sin_addr.s_addr = htonl(0x08080808); // 8.8.8.8
@@ -191,12 +237,15 @@ int query_send(Mode mode, std::string const &name)
 		}
 		Write16(0x0001); // Class: IN
 
-		if (mode == MDNS) {
-			addr.sin_addr.s_addr = htonl(0xe00000fb); // 224.0.0.251
-		} else if (mode == LLMNR) {
-			addr.sin_addr.s_addr = htonl(0xe00000fc); // 224.0.0.252
+		if (multicast) {
+			addr.sin_addr.s_addr = mreq.imr_multiaddr.s_addr;
 		}
 		sendto(sock, buf, pos, 0, (struct sockaddr *)&addr, sizeof(addr));
+	}
+
+	if (multicast) {
+		mreq.imr_interface.s_addr = INADDR_ANY;
+		setsockopt(sock, IPPROTO_IP, IP_ADD_MEMBERSHIP, (void *)&mreq, sizeof(mreq));
 	}
 
 	return sock;
@@ -210,14 +259,16 @@ void query_recv(Mode mode, int sock, std::string name, std::vector<uint32_t> *ad
 	}
 	
 	// 応答パケットを受信
+	int len = 0;
+	uint32_t from = 0;
 	char buf[2048];
 	socklen_t addrlen;
 	struct sockaddr_in senderinfo;
 	memset(buf, 0, sizeof(buf));
 	// recvfrom()を利用してUDPソケットからデータを受信
 	addrlen = sizeof(senderinfo);
-	const int len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&senderinfo, &addrlen);
-	uint32_t from = ntohl(senderinfo.sin_addr.s_addr);
+	len = recvfrom(sock, buf, sizeof(buf), 0, (struct sockaddr *)&senderinfo, &addrlen);
+	from = ntohl(senderinfo.sin_addr.s_addr);
 
 	if (0) {
 		// 送信元に関する情報を表示
@@ -336,38 +387,86 @@ void query(std::string name, std::vector<uint32_t> *addrs_out)
 {
 	addrs_out->clear();
 
-	for (int i = 0; name[i]; i++) {
-		if (i >= 15) { // too long
-			return; // invalid name
-		}
-		int c = (unsigned char)name[i];
-		if (isalnum(c)) {
-			// ok
-		} else if (isspace(c) || strchr(".\\/:+?\"<>|", c)) {
-			return; // invalid name
+	bool mdns = false;
+	bool wins = true;
+	bool llmnr = true;
+
+	{
+		char const *p = strchr(name.c_str(), '.');
+		if (p && strcmp(p, ".local") == 0) {
+			mdns = true;
+			wins = false;
+		} else {
+			for (int i = 0; name[i]; i++) {
+				if (i >= 15) { // too long
+					wins = false;
+				}
+				int c = (unsigned char)name[i];
+				if (isalnum(c)) {
+					// ok
+				} else if (isspace(c) || strchr(".\\/:+?\"<>|", c)) {
+					return; // invalid name
+				}
+			}
 		}
 	}
 
+
+	std::vector<netif_t> netifs;
+	get_netif_table(&netifs);
+
+	struct Query {
+		Mode mode = Mode::WINS;
+		int sock = -1;
+		Query() = default;
+		Query(Mode mode, int sock)
+			: mode(mode)
+			, sock(sock)
+		{
+		}
+	};
+
+	std::vector<Query> queries;
+
 	for (int retry = 0; retry < 3; retry++) {
-		int sock_wins = query_send(Mode::WINS, name);
-		int sock_llmnr = query_send(Mode::LLMNR, name);
+		auto AddQuery = [&](Mode mode, std::string const &name, netif_t const *netif){
+			queries.emplace_back(mode, query_send(mode, name, netif));
+		};
+		if (mdns) {
+			AddQuery(Mode::MDNS, name, nullptr);
+		}
+		if (wins) {
+			AddQuery(Mode::WINS, name, nullptr);
+			for (netif_t const &netif : netifs) {
+				AddQuery(Mode::WINS, name, &netif);
+			}
+		}
+		if (llmnr) {
+			AddQuery(Mode::LLMNR, name, nullptr);
+		}
+		std::sort(queries.begin(), queries.end(), [](Query const &l, Query const &r){ return l.sock < r.sock; });
+		int maxfd = queries.back().sock;
+
 
 		fd_set fds;
 		FD_ZERO(&fds);
-		FD_SET(sock_wins, &fds);
-		FD_SET(sock_llmnr, &fds);
+		for (Query const &q : queries) {
+			FD_SET(q.sock, &fds);
+		}
 		struct timeval timeout = {};
 		timeout.tv_sec = 0;
 		timeout.tv_usec = 300000;
-		select(std::max(sock_wins, sock_llmnr) + 1, &fds, nullptr, nullptr, &timeout);
-		if (FD_ISSET(sock_wins, &fds)) {
-			query_recv(Mode::WINS, sock_wins, name, addrs_out);
-		} else if (FD_ISSET(sock_llmnr, &fds)) {
-			query_recv(Mode::LLMNR, sock_wins, name, addrs_out);
+		select(maxfd + 1, &fds, nullptr, nullptr, &timeout);
+		for (Query const &q : queries) {
+			if (FD_ISSET(q.sock, &fds)) {
+				query_recv(q.mode, q.sock, name, addrs_out);
+				break;
+			}
 		}
 
-		close(sock_wins);
-		close(sock_llmnr);
+		for (Query const &q : queries) {
+			close(q.sock);
+		}
 
 		if (!addrs_out->empty()) break;
 	}
